@@ -1,0 +1,96 @@
+name: CLI E2E (Reusable)
+
+on:
+  workflow_call:
+    secrets:
+      TEST_BOT1_APP_ID:
+        required: true
+      TEST_BOT1_APP_SECRET:
+        required: true
+    outputs:
+      junit_summary_json:
+        description: JUnit summary as JSON string
+        value: ${{ jobs.cli-e2e.outputs.junit_summary_json }}
+
+permissions:
+  contents: read
+
+jobs:
+  cli-e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    outputs:
+      junit_summary_json: ${{ steps.junit.outputs.summary_json }}
+    env:
+      TEST_BOT1_APP_ID: ${{ secrets.TEST_BOT1_APP_ID }}
+      TEST_BOT1_APP_SECRET: ${{ secrets.TEST_BOT1_APP_SECRET }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
+        with:
+          go-version-file: go.mod
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
+        with:
+          python-version: '3.x'
+
+      - name: Build lark-cli
+        run: make build
+
+      - name: Configure bot credentials
+        run: |
+          if [ -z "$TEST_BOT1_APP_ID" ] || [ -z "$TEST_BOT1_APP_SECRET" ]; then
+            echo "::error::Missing required secrets: TEST_BOT1_APP_ID / TEST_BOT1_APP_SECRET"
+            exit 1
+          fi
+          printf '%s\n' "$TEST_BOT1_APP_SECRET" | ./lark-cli config init --app-id "$TEST_BOT1_APP_ID" --app-secret-stdin
+
+      - name: Run CLI E2E tests
+        id: test
+        continue-on-error: true
+        env:
+          LARK_CLI_BIN: ${{ github.workspace }}/lark-cli
+        run: |
+          packages=$(go list ./tests/cli_e2e/... | grep -v '^github.com/larksuite/cli/tests/cli_e2e$' | grep -v '/demo$')
+          if [ -z "$packages" ]; then
+            echo "No CLI E2E packages to test after exclusions."
+            exit 1
+          fi
+          go run gotest.tools/gotestsum@v1.12.3 --format testname --junitfile cli-e2e-report.xml -- -count=1 -v $packages
+
+      - name: Export JUnit summary outputs
+        id: junit
+        if: ${{ always() && !cancelled() }}
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          import xml.etree.ElementTree as ET
+
+          report_path = "cli-e2e-report.xml"
+          tests = failures = errors = skipped = 0
+          try:
+            root = ET.parse(report_path).getroot()
+            suites = [root] if root.tag == "testsuite" else root.findall("testsuite")
+            for suite in suites:
+              tests += int(suite.attrib.get("tests", 0))
+              failures += int(suite.attrib.get("failures", 0))
+              errors += int(suite.attrib.get("errors", 0))
+              skipped += int(suite.attrib.get("skipped", 0))
+          except Exception:
+            pass
+
+          passed = tests - failures - errors - skipped
+          summary = {
+            "total": tests,
+            "passed": passed,
+            "failures": failures,
+            "errors": errors,
+            "skipped": skipped,
+          }
+          print(f"summary_json={json.dumps(summary, separators=(',', ':'))}")
+          PY
+
+      - name: Fail job if tests failed
+        if: ${{ steps.test.outcome == 'failure' }}
+        run: exit 1

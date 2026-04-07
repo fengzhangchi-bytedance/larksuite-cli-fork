@@ -1,0 +1,83 @@
+name: Pre-release Checks
+
+concurrency:
+  group: pre-release-${{ github.ref }}
+  cancel-in-progress: true
+
+on:
+  schedule:
+    # Weekdays at 20:00 Beijing time (UTC+8) == 12:00 UTC
+    - cron: '0 12 * * 1-5'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  cli-e2e:
+    uses: ./.github/workflows/cli-e2e-reusable.yml
+    secrets:
+      TEST_BOT1_APP_ID: ${{ secrets.TEST_BOT1_APP_ID }}
+      TEST_BOT1_APP_SECRET: ${{ secrets.TEST_BOT1_APP_SECRET }}
+
+  report:
+    needs: [cli-e2e]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Report pre-release result (webhook)
+        env:
+          WEBHOOK_URL: ${{ secrets.PRE_RELEASE_WEBHOOK_URL }}
+          WORKFLOW_NAME: ${{ github.workflow }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          REF: ${{ github.ref }}
+          SHA: ${{ github.sha }}
+          TRIGGER: ${{ github.event_name }}
+          CLI_E2E_RESULT: ${{ needs.cli-e2e.result }}
+          CLI_E2E_JUNIT_SUMMARY_JSON: ${{ needs.cli-e2e.outputs.junit_summary_json }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${WEBHOOK_URL:-}" ]; then
+            echo "::error::Missing required secret: PRE_RELEASE_WEBHOOK_URL"
+            exit 1
+          fi
+
+          python3 - <<'PY' > payload.json
+          import json
+          import os
+
+          cli_e2e_result = os.environ.get("CLI_E2E_RESULT") or "unknown"
+          summary_raw = os.environ.get("CLI_E2E_JUNIT_SUMMARY_JSON") or ""
+          try:
+            summary = json.loads(summary_raw) if summary_raw else {}
+          except Exception:
+            summary = {}
+
+          checks = {
+            "cli_e2e": {
+              "status": cli_e2e_result,
+              "summary": summary,
+            },
+          }
+
+          overall = "success" if all(v.get("status") == "success" for v in checks.values()) else "failure"
+
+          payload = {
+            "event": "pre_release",
+            "status": overall,
+            "repo": os.environ.get("GITHUB_REPOSITORY"),
+            "ref": os.environ.get("REF"),
+            "sha": os.environ.get("SHA"),
+            "workflow": os.environ.get("WORKFLOW_NAME"),
+            "trigger": os.environ.get("TRIGGER"),
+            "run_url": os.environ.get("RUN_URL"),
+            "checks": checks,
+          }
+          print(json.dumps(payload, ensure_ascii=False))
+          PY
+
+          curl --fail-with-body -sS -X POST "$WEBHOOK_URL" \
+            -H 'Content-Type: application/json' \
+            --data-binary @payload.json
